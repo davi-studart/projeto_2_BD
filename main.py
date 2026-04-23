@@ -3,7 +3,7 @@ import re
 import tkinter as tk
 from tkinter import ttk, messagebox
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import List, Tuple, Set, Dict
 
 import networkx as nx
 
@@ -57,16 +57,11 @@ class SQLProcessor:
         if not match:
             raise ValueError("Consulta SQL fora do padrão suportado: SELECT ... FROM ... [INNER JOIN ... ON ...] [WHERE ...]")
 
-        select_fields = [item.strip() for item in match.group("select").split(",")]
-        from_table = match.group("from")
-        joins = self._parse_joins(match.group("joins") or "")
-        where_conditions = self._parse_where(match.group("where") or "")
-
         query = QueryData(
-            select_fields=select_fields,
-            from_table=from_table,
-            joins=joins,
-            where_conditions=where_conditions,
+            select_fields=[item.strip() for item in match.group("select").split(",")],
+            from_table=match.group("from"),
+            joins=self._parse_joins(match.group("joins") or ""),
+            where_conditions=self._parse_where(match.group("where") or ""),
         )
         self._validate(query)
         return query
@@ -75,14 +70,12 @@ class SQLProcessor:
         joins = []
         if not joins_text:
             return joins
-
         join_pattern = re.compile(
             r"INNER\s+JOIN\s+([A-Za-z_][A-Za-z0-9_]*)\s+ON\s+([A-Za-z_][A-Za-z0-9_\.]*?)\s*(=|<>|<=|>=|<|>)\s*([A-Za-z_][A-Za-z0-9_\.]*)",
             re.IGNORECASE,
         )
         for table, left, op, right in join_pattern.findall(joins_text):
             joins.append(JoinClause(table=table, left=left, op=op, right=right))
-
         if not joins:
             raise ValueError("INNER JOIN encontrado, mas não foi possível analisar as cláusulas ON.")
         return joins
@@ -91,7 +84,6 @@ class SQLProcessor:
         conditions = []
         if not where_text:
             return conditions
-
         tokens = re.split(r"\s+(AND)\s+", where_text, flags=re.IGNORECASE)
         connector = "AND"
         for token in tokens:
@@ -100,31 +92,25 @@ class SQLProcessor:
             if token.upper() == "AND":
                 connector = "AND"
                 continue
-
             cleaned = token.strip().replace("(", "").replace(")", "")
             m = re.match(r"(.+?)\s*(=|<>|<=|>=|<|>)\s*(.+)", cleaned)
             if not m:
                 raise ValueError(f"Condição WHERE inválida: {token}")
-
             left, op, right = [x.strip() for x in m.groups()]
             conditions.append(Condition(left=left, op=op, right=right, connector=connector))
         return conditions
 
     def _validate(self, query: QueryData):
         tables = [query.from_table] + [j.table for j in query.joins]
-
         for table in tables:
             if table not in self.schema:
                 raise ValueError(f"Tabela inválida: {table}")
-
         for field in query.select_fields:
             if field != "*":
                 self._validate_field_ref(field, tables)
-
         for join in query.joins:
             self._validate_field_ref(join.left, tables)
             self._validate_field_ref(join.right, tables)
-
         for cond in query.where_conditions:
             self._validate_operand(cond.left, tables)
             self._validate_operand(cond.right, tables, allow_literal=True)
@@ -151,6 +137,48 @@ class SQLProcessor:
     def _is_literal(self, value: str) -> bool:
         return bool(re.fullmatch(r"'[^']*'|\d+(?:\.\d+)?", value))
 
+    def _table_from_operand(self, operand: str) -> str | None:
+        if "." in operand:
+            return operand.split(".", 1)[0]
+        return None
+
+    def _conditions_for_table(self, query: QueryData, table: str) -> List[Condition]:
+        result = []
+        for cond in query.where_conditions:
+            left_table = self._table_from_operand(cond.left)
+            right_table = self._table_from_operand(cond.right)
+            tables = {t for t in [left_table, right_table] if t}
+            if not tables or tables == {table}:
+                result.append(cond)
+        return result
+
+    def _fields_for_table(self, query: QueryData, table: str) -> List[str]:
+        needed: Set[str] = set()
+        if query.select_fields == ["*"]:
+            return self.schema[table][:]
+        for field in query.select_fields:
+            if "." in field:
+                t, c = field.split(".", 1)
+                if t == table:
+                    needed.add(c)
+            elif field in self.schema.get(table, []):
+                needed.add(field)
+        for cond in query.where_conditions:
+            for operand in [cond.left, cond.right]:
+                if "." in operand:
+                    t, c = operand.split(".", 1)
+                    if t == table and c in self.schema[table]:
+                        needed.add(c)
+        for join in query.joins:
+            for operand in [join.left, join.right]:
+                if "." in operand:
+                    t, c = operand.split(".", 1)
+                    if t == table and c in self.schema[table]:
+                        needed.add(c)
+        if not needed:
+            needed.update(self.schema[table])
+        return sorted(needed)
+
     def relational_algebra(self, query: QueryData) -> str:
         expr = query.from_table
         for join in query.joins:
@@ -162,22 +190,38 @@ class SQLProcessor:
             expr = f"π[{', '.join(query.select_fields)}]({expr})"
         return expr
 
+    def optimized_relational_algebra(self, query: QueryData) -> str:
+        branch_exprs: Dict[str, str] = {}
+        tables = [query.from_table] + [j.table for j in query.joins]
+        for table in tables:
+            expr = table
+            if query.select_fields != ["*"]:
+                expr = f"π[{', '.join(self._fields_for_table(query, table))}]({expr})"
+            table_conds = self._conditions_for_table(query, table)
+            if table_conds:
+                cond_text = " AND ".join(f"{c.left} {c.op} {c.right}" for c in table_conds)
+                expr = f"σ[{cond_text}]({expr})"
+            branch_exprs[table] = expr
+
+        expr = branch_exprs[query.from_table]
+        for join in query.joins:
+            expr = f"({expr} ⋈[{join.left} {join.op} {join.right}] {branch_exprs[join.table]})"
+        if query.select_fields != ["*"]:
+            expr = f"π[{', '.join(query.select_fields)}]({expr})"
+        return expr
+
     def optimize(self, query: QueryData) -> Tuple[List[str], QueryData, str]:
         optimized = copy.deepcopy(query)
         steps = []
-
+        if optimized.select_fields != ["*"]:
+            steps.append("1. Aplicar projeções antecipadas nas tabelas para reduzir atributos intermediários.")
         if optimized.where_conditions:
             optimized.where_conditions.sort(key=self._condition_weight, reverse=True)
-            steps.append("Aplicar primeiro as seleções mais restritivas para reduzir tuplas.")
-
-        if optimized.select_fields != ["*"]:
-            steps.append("Antecipar projeções para reduzir atributos intermediários.")
-
+            steps.append("2. Aplicar seleções (WHERE) em cada ramo antes das junções para reduzir tuplas.")
         if optimized.joins:
             optimized.joins.sort(key=self._join_weight, reverse=True)
-            steps.append("Priorizar junções mais restritivas e evitar produto cartesiano.")
-
-        return steps, optimized, self.relational_algebra(optimized)
+            steps.append("3. Executar junções após projeções e seleções, priorizando as mais restritivas.")
+        return steps, optimized, self.optimized_relational_algebra(optimized)
 
     def _condition_weight(self, cond: Condition) -> int:
         return 3 if cond.op == "=" else 2
@@ -185,63 +229,124 @@ class SQLProcessor:
     def _join_weight(self, join: JoinClause) -> int:
         return 3 if join.op == "=" else 1
 
-    def build_plan(self, query: QueryData) -> List[str]:
-        plan = [f"Ler tabela base {query.from_table}."]
-        for cond in query.where_conditions:
-            plan.append(f"Aplicar seleção: {cond.left} {cond.op} {cond.right}.")
-        for join in query.joins:
-            plan.append(f"Executar INNER JOIN com {join.table} usando {join.left} {join.op} {join.right}.")
+    def build_plan(self, query: QueryData, optimized: bool = False) -> List[str]:
+        plan = []
+        if optimized and query.select_fields != ["*"]:
+            plan.append(f"Aplicar projeção inicial em {query.from_table}: {', '.join(self._fields_for_table(query, query.from_table))}.")
+            for join in query.joins:
+                plan.append(f"Aplicar projeção inicial em {join.table}: {', '.join(self._fields_for_table(query, join.table))}.")
+        else:
+            plan.append(f"Ler tabela base {query.from_table}.")
+
+        if not optimized:
+            current_source = query.from_table
+            for join in query.joins:
+                plan.append(f"Executar INNER JOIN entre {current_source} e {join.table} usando {join.left} {join.op} {join.right}.")
+                current_source = f"resultado parcial + {join.table}"
+            for cond in query.where_conditions:
+                plan.append(f"Aplicar seleção após as junções: {cond.left} {cond.op} {cond.right}.")
+        else:
+            processed_tables = [query.from_table] + [j.table for j in query.joins]
+            for table in processed_tables:
+                for cond in self._conditions_for_table(query, table):
+                    plan.append(f"Aplicar seleção no ramo {table}: {cond.left} {cond.op} {cond.right}.")
+            for join in query.joins:
+                plan.append(f"Executar INNER JOIN com {join.table} usando {join.left} {join.op} {join.right}.")
+
         if query.select_fields != ["*"]:
             plan.append(f"Aplicar projeção final: {', '.join(query.select_fields)}.")
         plan.append("Exibir resultado final na interface.")
         return plan
 
+    def _short_projection_label(self, fields: List[str], title: str) -> str:
+        preview = ", ".join(fields[:3])
+        if len(fields) > 3:
+            preview += ", ..."
+        return f"{title}\n{preview}"
+
+    def _where_label(self, conds: List[Condition]) -> str:
+        if not conds:
+            return "where"
+        first = conds[0]
+        if len(conds) == 1:
+            return f"where\n{first.left} {first.op} {first.right}"
+        return f"where\n{first.left} {first.op} {first.right}\n+{len(conds)-1} condição(ões)"
+
     def build_operator_graph(self, query: QueryData, optimized: bool = False):
         graph = nx.DiGraph()
         node_counter = 0
 
-        def add_node(label, kind, meta=None):
+        def add_node(label, kind, display=None):
             nonlocal node_counter
             node_id = f"n{node_counter}"
             node_counter += 1
-            graph.add_node(node_id, label=label, kind=kind, meta=meta or "")
+            graph.add_node(node_id, label=label, kind=kind, display=display or label)
             return node_id
 
-        current = add_node(f"Tabela\n{query.from_table}", "table", query.from_table)
+        if not optimized:
+            current = add_node("Table", "table", query.from_table)
+            for join in query.joins:
+                join_table = add_node("Table", "table", join.table)
+                join_node = add_node("Join", "join", "Join")
+                graph.add_edge(current, join_node)
+                graph.add_edge(join_table, join_node)
+                current = join_node
+            if query.where_conditions:
+                where_label = self._where_label(query.where_conditions)
+                where_node = add_node("where", "selection", where_label)
+                graph.add_edge(current, where_node)
+                current = where_node
+            if query.select_fields != ["*"]:
+                final_proj = add_node("projection", "projection", self._short_projection_label(query.select_fields, "projection"))
+                graph.add_edge(current, final_proj)
+                current = final_proj
+            result = add_node("Result", "result", "Result")
+            graph.add_edge(current, result)
+            return graph
 
-        for cond in query.where_conditions:
-            suffix = "\n(reduz tuplas)" if optimized else ""
-            sel = add_node(f"Seleção\n{cond.left} {cond.op} {cond.right}{suffix}", "selection")
-            graph.add_edge(current, sel, label="fluxo")
-            current = sel
+        branch_outputs: Dict[str, str] = {}
+        ordered_tables = [query.from_table] + [j.table for j in query.joins]
 
+        for table in ordered_tables:
+            table_node = add_node("Table", "table", table)
+            current = table_node
+
+            if query.select_fields != ["*"]:
+                proj_fields = self._fields_for_table(query, table)
+                proj_node = add_node("projection", "projection", self._short_projection_label(proj_fields, "projection"))
+                graph.add_edge(current, proj_node)
+                current = proj_node
+
+            table_conds = self._conditions_for_table(query, table)
+            if table_conds:
+                where_node = add_node("where", "selection", self._where_label(table_conds))
+                graph.add_edge(current, where_node)
+                current = where_node
+
+            branch_outputs[table] = current
+
+        current = branch_outputs[query.from_table]
         for join in query.joins:
-            join_table = add_node(f"Tabela\n{join.table}", "table", join.table)
-            join_node = add_node(f"INNER JOIN\n{join.left} {join.op} {join.right}", "join")
-            graph.add_edge(current, join_node, label="esquerda")
-            graph.add_edge(join_table, join_node, label="direita")
+            join_node = add_node("Join", "join", "Join")
+            graph.add_edge(current, join_node)
+            graph.add_edge(branch_outputs[join.table], join_node)
             current = join_node
 
         if query.select_fields != ["*"]:
-            suffix = "\n(reduz atributos)" if optimized else ""
-            proj = add_node(f"Projeção\n{', '.join(query.select_fields)}{suffix}", "projection")
-            graph.add_edge(current, proj, label="fluxo")
-            current = proj
+            final_proj = add_node("projection", "projection", self._short_projection_label(query.select_fields, "projection"))
+            graph.add_edge(current, final_proj)
+            current = final_proj
 
-        result_label = "Resultado\nOtimizado" if optimized else "Resultado\nOriginal"
-        result = add_node(result_label, "result")
-        graph.add_edge(current, result, label="saída")
+        result = add_node("Result", "result", "Result")
+        graph.add_edge(current, result)
         return graph
 
 class GraphCanvas(ttk.LabelFrame):
     def __init__(self, parent, title):
         super().__init__(parent, text=title, padding=8)
-        self.canvas = tk.Canvas(self, bg="white", height=360)
+        self.canvas = tk.Canvas(self, bg="#ffffff", height=520, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
-        self.legend = ttk.Label(
-            self,
-            text="Azul: tabela | Amarelo: seleção | Verde: junção | Roxo: projeção | Cinza: resultado"
-        )
+        self.legend = ttk.Label(self, text="Table | projection | where | Join | Result")
         self.legend.pack(anchor="w", pady=(6, 0))
 
     def clear(self):
@@ -251,37 +356,34 @@ class GraphCanvas(ttk.LabelFrame):
         self.clear()
         if not graph.nodes:
             return
-
         self.update_idletasks()
-        width = max(self.canvas.winfo_width(), 560)
-        height = max(self.canvas.winfo_height(), 360)
-        pos = self._layered_positions(graph, width, height)
+        width = max(self.canvas.winfo_width(), 1100)
+        height = max(self.canvas.winfo_height(), 520)
+        pos = self._example_style_positions(graph, width, height)
 
-        for u, v, data in graph.edges(data=True):
+        for u, v in graph.edges():
             x1, y1 = pos[u]
             x2, y2 = pos[v]
-            self.canvas.create_line(x1, y1, x2, y2, arrow=tk.LAST, width=2, fill="#4b5563")
-            mx, my = (x1 + x2) / 2, (y1 + y2) / 2
-            if data.get("label"):
-                self.canvas.create_text(mx, my - 10, text=data["label"], font=("Arial", 8), fill="#374151")
+            self.canvas.create_line(x1 + 70, y1, x2 - 70, y2, fill="#222222", width=1.4)
+
+        styles = {
+            "table": {"fill": "#ffffff", "outline": "#000000", "text": "#000000"},
+            "projection": {"fill": "#7a6492", "outline": "#5e4d71", "text": "#ffffff"},
+            "selection": {"fill": "#f1d400", "outline": "#bca700", "text": "#000000"},
+            "join": {"fill": "#2e9bd3", "outline": "#247eab", "text": "#ffffff"},
+            "result": {"fill": "#70839a", "outline": "#5c6c80", "text": "#ffffff"},
+        }
 
         for node, attrs in graph.nodes(data=True):
             x, y = pos[node]
-            label = attrs.get("label", node)
-            kind = attrs.get("kind", "default")
-            fill = {
-                "table": "#dbeafe",
-                "selection": "#fef3c7",
-                "join": "#dcfce7",
-                "projection": "#ede9fe",
-                "result": "#e5e7eb",
-            }.get(kind, "#f3f4f6")
+            label = attrs.get("display", attrs.get("label", node))
+            kind = attrs.get("kind", "table")
+            style = styles[kind]
+            w, h = 130, 58
+            self.canvas.create_rectangle(x - w/2, y - h/2, x + w/2, y + h/2, fill=style["fill"], outline=style["outline"], width=1)
+            self.canvas.create_text(x, y, text=label, width=w - 18, font=("Arial", 10, "bold"), fill=style["text"], justify="center")
 
-            w, h = 160, 60
-            self.canvas.create_rectangle(x - w/2, y - h/2, x + w/2, y + h/2, fill=fill, outline="#111827", width=2)
-            self.canvas.create_text(x, y, text=label, width=w - 14, font=("Arial", 9, "bold"), justify="center")
-
-    def _layered_positions(self, graph: nx.DiGraph, width: int, height: int):
+    def _example_style_positions(self, graph: nx.DiGraph, width: int, height: int):
         indegrees = dict(graph.in_degree())
         roots = [n for n, deg in indegrees.items() if deg == 0]
         depths = {}
@@ -299,22 +401,38 @@ class GraphCanvas(ttk.LabelFrame):
             layers.setdefault(depth, []).append(node)
 
         max_depth = max(layers) if layers else 0
-        x_gap = width / (max_depth + 2)
+        left_margin = 90
+        right_margin = 90
+        top_margin = 70
+        bottom_margin = 70
+        usable_w = max(1, width - left_margin - right_margin)
+        usable_h = max(1, height - top_margin - bottom_margin)
+        x_gap = usable_w / max(1, max_depth)
         pos = {}
+
         for depth in range(max_depth + 1):
             nodes = layers.get(depth, [])
             if not nodes:
                 continue
-            y_gap = height / (len(nodes) + 1)
-            for i, node in enumerate(nodes, start=1):
-                pos[node] = ((depth + 1) * x_gap, i * y_gap)
+            x = left_margin + depth * x_gap
+            if len(nodes) == 1:
+                ys = [top_margin + usable_h / 2]
+            elif len(nodes) == 2:
+                ys = [top_margin + usable_h * 0.28, top_margin + usable_h * 0.72]
+            elif len(nodes) == 3:
+                ys = [top_margin + usable_h * 0.18, top_margin + usable_h * 0.50, top_margin + usable_h * 0.82]
+            else:
+                step = usable_h / (len(nodes) + 1)
+                ys = [top_margin + step * i for i in range(1, len(nodes) + 1)]
+            for node, y in zip(nodes, ys):
+                pos[node] = (x, y)
         return pos
 
 class App:
     def __init__(self, root):
         self.root = root
         self.root.title("Processador de Consultas SQL - Dois Grafos")
-        self.root.geometry("1400x900")
+        self.root.geometry("1400x920")
         self.processor = SQLProcessor()
         self._build_ui()
         self._load_example()
@@ -347,20 +465,15 @@ class App:
             text.pack(fill="both", expand=True)
             self.tabs[name] = text
 
-        graphs_tab = ttk.Frame(notebook, padding=10)
-        notebook.add(graphs_tab, text="Grafos")
+        original_graph_tab = ttk.Frame(notebook, padding=10)
+        notebook.add(original_graph_tab, text="Grafo Não Otimizado")
+        self.original_graph_canvas = GraphCanvas(original_graph_tab, "Grafo Não Otimizado")
+        self.original_graph_canvas.pack(fill="both", expand=True)
 
-        graphs_container = ttk.Frame(graphs_tab)
-        graphs_container.pack(fill="both", expand=True)
-        graphs_container.columnconfigure(0, weight=1)
-        graphs_container.columnconfigure(1, weight=1)
-        graphs_container.rowconfigure(0, weight=1)
-
-        self.original_graph_canvas = GraphCanvas(graphs_container, "Grafo da Álgebra Relacional Não Otimizada")
-        self.original_graph_canvas.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-
-        self.optimized_graph_canvas = GraphCanvas(graphs_container, "Grafo da Álgebra Relacional Otimizada")
-        self.optimized_graph_canvas.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        optimized_graph_tab = ttk.Frame(notebook, padding=10)
+        notebook.add(optimized_graph_tab, text="Grafo Otimizado")
+        self.optimized_graph_canvas = GraphCanvas(optimized_graph_tab, "Grafo Otimizado")
+        self.optimized_graph_canvas.pack(fill="both", expand=True)
 
         schema_frame = ttk.LabelFrame(main, text="Esquema BD_Vendas usado na validação", padding=10)
         schema_frame.pack(fill="x", pady=(10, 0))
@@ -425,13 +538,16 @@ class App:
             )
             self._set_tab("Álgebra Relacional", algebra_text)
 
-            plan_text = "\n".join(f"{i + 1}. {step}" for i, step in enumerate(self.processor.build_plan(optimized_query)))
+            plan_original = self.processor.build_plan(query, optimized=False)
+            plan_optimized = self.processor.build_plan(optimized_query, optimized=True)
+            plan_text = (
+                "Plano original:\n" + "\n".join(f"{i + 1}. {step}" for i, step in enumerate(plan_original)) +
+                "\n\nPlano otimizado:\n" + "\n".join(f"{i + 1}. {step}" for i, step in enumerate(plan_optimized))
+            )
             self._set_tab("Plano de Execução", plan_text)
 
-            original_graph = self.processor.build_operator_graph(query, optimized=False)
-            optimized_graph = self.processor.build_operator_graph(optimized_query, optimized=True)
-            self.original_graph_canvas.draw_graph(original_graph)
-            self.optimized_graph_canvas.draw_graph(optimized_graph)
+            self.original_graph_canvas.draw_graph(self.processor.build_operator_graph(query, optimized=False))
+            self.optimized_graph_canvas.draw_graph(self.processor.build_operator_graph(optimized_query, optimized=True))
 
         except Exception as e:
             for widget in self.tabs.values():
