@@ -43,7 +43,7 @@ class GraphCanvas(ttk.LabelFrame):
             label = attrs.get("display", attrs.get("label", node))
             kind = attrs.get("kind", "table")
             style = styles[kind]
-            w, h = 130, 58
+            w, h = 130, 130
             self.canvas.create_rectangle(x - w/2, y - h/2, x + w/2, y + h/2, fill=style["fill"], outline=style["outline"], width=1)
             self.canvas.create_text(x, y, text=label, width=w - 18, font=("Arial", 10, "bold"), fill=style["text"], justify="center")
 

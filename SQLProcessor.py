@@ -176,16 +176,6 @@ class SQLProcessor:
             needed.update(self.schema[table])
         return sorted(needed)
 
-    def relational_algebra(self, query: QueryData) -> str:
-        expr = query.from_table
-        for join in query.joins:
-            expr = f"({expr} ⋈[{join.left} {join.op} {join.right}] {join.table})"
-        if query.where_conditions:
-            conds = " AND ".join(f"{c.left} {c.op} {c.right}" for c in query.where_conditions)
-            expr = f"σ[{conds}]({expr})"
-        if query.select_fields != ["*"]:
-            expr = f"π[{', '.join(query.select_fields)}]({expr})"
-        return expr
 
     def optimized_relational_algebra(self, query: QueryData) -> str:
         branch_exprs: Dict[str, str] = {}
